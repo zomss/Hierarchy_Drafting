@@ -97,6 +97,7 @@ def pad_path(path, length, pad_value=-2):
 def get_prompt(lst_token, token_map):
     if lst_token in token_map:
         return token_map[lst_token]
+        # return [token[0] for token in token_map[lst_token]]
     return []
 
 def get_history(lst_token):
@@ -131,6 +132,7 @@ def get_draft_tokens(lst_token, previous_tokens, token_map, vocab_size, order, G
     if lst_token == None:
         lst_token = previous_tokens[-1]
     tokens = []
+    guess_source = -1
     for o in order:
         if o == "W":
             tokens += get_prompt(lst_token, token_map)
@@ -150,8 +152,8 @@ def get_draft_tokens(lst_token, previous_tokens, token_map, vocab_size, order, G
         else:
             raise NotImplementedError
         if len(tokens) >= 7:
-            return tokens, guess_source
-    return [], -1
+            return tokens[:7], guess_source
+    return tokens, guess_source
 
 def greedy_search_proxy(self, *args, **kwargs):
     USE_LADE = int(os.environ.get("USE_LADE", 0))
@@ -179,6 +181,8 @@ def update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WIND
         if lst_token not in token_map:
             token_map[lst_token] = []
         tup = tuple(past_tokens[ll][0] for ll in range(1, LEVEL - 1)) + (new_results[0],)
+
+
         if tup in token_map[lst_token]:
             token_map[lst_token].remove(tup)
             token_map[lst_token].append(tup)
@@ -203,13 +207,26 @@ def update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WIND
                 token_map[past_tokens[0][i - 1]] = token_map[past_tokens[0][i - 1]][1:] + [tup]
 
     elif GUESS_SET_SIZE != -1 and not LRU:
+        
+        # if lst_token not in token_map:
+        #     token_map[lst_token] = []
+        # for i in range(GUESS_SET_SIZE):
+        #     tup = tuple(tok for tok in new_results[0])
+        #     if tup in token_map[lst_token]:
+        #         token_map[lst_token].remove(tup)
+        #         token_map[lst_token].append(tup)
+        #     elif len(token_map[lst_token]) < GUESS_SET_SIZE:
+        #         token_map[lst_token].append(tup) 
+        #     else:
+        #         assert len(token_map[lst_token]) == GUESS_SET_SIZE
+        #         token_map[lst_token] = token_map[lst_token][1:] + [tup]
 
         if lst_token not in token_map:
             token_map[lst_token] = []
         for i in range(GUESS_SET_SIZE):
             tup = tuple(tok for tok in new_results[0])
             if tup not in token_map[lst_token]:
-                token_map[lst_token] = token_map[lst_token] + [tup]
+                token_map[lst_token] = [tup] + token_map[lst_token]
             if len(token_map[lst_token]) == GUESS_SET_SIZE:
                 break
 
@@ -558,6 +575,8 @@ def greedy_search_chat(
     else:
         return input_ids
 
+import copy
+
 def jacobi_greedy_search_multilevel(
     self,
     input_ids: torch.LongTensor,
@@ -805,6 +824,8 @@ def jacobi_greedy_search_multilevel(
                                    spaces_between_special_tokens=False, clean_up_tokenization_spaces=True,)
         prev = len(init)
 
+    # History.history = copy.deepcopy(History.og_history)
+
     accept_length_list = []
     while True:
         torch.cuda.synchronize()
@@ -966,9 +987,12 @@ def jacobi_greedy_search_multilevel(
                         correct = [first_guess] + guess_results[egx:egx + GUESS_SIZE]
                         myguess = guess_tokens[egx:egx + GUESS_SIZE]
                         gg = 0
-                        for gg in range(len(myguess)):
+                        for gg in range(len(correct)):
+                            if gg == 4:
+                                break
                             if myguess[gg] != correct[gg]:
                                 break 
+                        # gg += 1
                         if gg > max_hit:
                             max_hit = gg 
                             max_hit_idx = eg 
@@ -1006,6 +1030,8 @@ def jacobi_greedy_search_multilevel(
                 assert len(past_tokens[LEVEL - 2]) == WINDOW_SIZE and len(new_results) == WINDOW_SIZE
 
                 update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
+                # if max_hit >= 3:
+                    # from IPython import embed; embed(); exit(0)
 
                 if ALWAYS_FWD_ONE:
                     past_tokens[0] = past_tokens[1][1:]
@@ -1056,9 +1082,11 @@ def jacobi_greedy_search_multilevel(
                     correct = [first_guess] + guess_results[egx:egx + GUESS_SIZE]
                     myguess = guess_tokens[egx:egx + GUESS_SIZE]
                     gg = 0
-                    for gg in range(len(myguess)):
+                    for gg in range(len(correct)):
                         if myguess[gg] != correct[gg]:
                             break 
+                        if gg == 4:
+                            break
                     if gg > max_hit:
                         max_hit = gg 
                         max_hit_idx = eg 
@@ -1110,6 +1138,14 @@ def jacobi_greedy_search_multilevel(
 
         lst_token = hits[max_hit]
 
+        # if max_hit >= 3:
+            # from IPython import embed; embed(); exit(0)
+
+        # if max_hit >= 3:
+            # temps = [[lst_token] + list(guess_token)  for guess_token in guess_tokens_ if guess_token[0] == hits[0] and guess_token[1] == hits[1]]
+            # for temp in temps:
+            #     append_new_generated_pool(temp, token_map, LEVEL, GUESS_SET_SIZE)            
+
         #stopping condition
         for hit_idx in range(max_hit + 1):
             if eos_token_id is not None and hits[hit_idx] == eos_token_id[0]:
@@ -1119,7 +1155,8 @@ def jacobi_greedy_search_multilevel(
                 break
             else:
                 all_old_tokens.append(hits[max_hit])
-                append_new_generated_pool(all_old_tokens[-LEVEL:], token_map, LEVEL, GUESS_SET_SIZE)
+                # append_new_generated_pool(all_old_tokens[-LEVEL:], token_map, LEVEL, GUESS_SET_SIZE)            
+
 
 
         if chat:
@@ -1139,6 +1176,9 @@ def jacobi_greedy_search_multilevel(
             prev = len(all_str)
         
         input_ids = torch.cat([input_ids, torch.tensor(hits[:max_hit + 1], device=next_tokens.device, dtype=next_tokens.dtype).unsqueeze(0)], dim=-1)
+
+        for hit_ids in range(max_hit): 
+            append_new_generated_pool(input_ids[0,-LEVEL-hit_ids:-hit_ids].tolist(), token_map, LEVEL, GUESS_SET_SIZE)
 
         accept_length_tree = len(all_old_tokens) - cur_length
         torch.cuda.synchronize()
@@ -1207,6 +1247,7 @@ def jacobi_greedy_search_multilevel(
                 hidden_states=decoder_hidden_states,
             )
     else:
+        # from IPython import embed; embed(); exit(0)
         idx = steps - 1
         return input_ids, idx, accept_length_list
 
@@ -1721,7 +1762,6 @@ def jacobi_sample_multilevel(
             outputs.past_key_values = past_key_values
 
             lst_token = hits[max_hit]
-
         else:
             probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
@@ -1744,7 +1784,6 @@ def jacobi_sample_multilevel(
                     while g_idx < len(guess_indices):
                         guess_idx = guess_indices[g_idx]
                         guess_offset = guess_idx * GUESS_SIZE
-
 
                         #draft_guess is draft model (by lookahead) generation
                         draft_guess = guess_tokens[guess_offset + idx_in_ngram]
@@ -1806,8 +1845,7 @@ def jacobi_sample_multilevel(
 
             lst_token = hits[max_hit]
 
-            
-
+        
         for hit_ids in range(max_hit + 1):
             if eos_token_id is not None and hits[hit_ids] == eos_token_id[0]:
                 all_old_tokens.append(hits[hit_ids])
@@ -1816,7 +1854,7 @@ def jacobi_sample_multilevel(
                 break
             else:
                 all_old_tokens.append(hits[hit_ids])
-                append_new_generated_pool(all_old_tokens[-LEVEL:], token_map, LEVEL, GUESS_SET_SIZE)
+                # append_new_generated_pool(all_old_tokens[-LEVEL:], token_map, LEVEL, GUESS_SET_SIZE)
 
         if chat:
 
