@@ -12,14 +12,24 @@ import draftretriever
 import random
 import time
 from collections import Counter
+import multiprocessing as mp
+import asyncio
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+from collections import defaultdict
+import concurrent.futures
 
 FUNC_MAP = {}
 CONFIG_MAP = {}
 COLOR_PRINT = int(os.environ.get("COLOR_PRINT", 0))
 
+executor = ThreadPoolExecutor(max_workers=4)  # Adjust the number of workers as needed
+
 class History:
     history = None
-    
+        
     @classmethod
     def get_history(cls, dir):
         GUESS_SET_SIZE = CONFIG_MAP.get("GUESS_SET_SIZE", 60)
@@ -32,8 +42,8 @@ class History:
 
         for token in reversed(history_tokens):
             token = [int(t) for t in token] 
-            lst_token = token[0]
-            tup = tuple(token[1:])
+            lst_token = (token[0], token[1])
+            tup = tuple(token[2:])
             
             if GUESS_SET_SIZE != -1: #limited guess set size for each key, lru policy  
                 if lst_token not in history_map:
@@ -94,20 +104,22 @@ def pad_path(path, length, pad_value=-2):
     else:
         return path + [pad_value] * (length - len(path))
 
-def get_prompt(lst_token, token_map):
+def get_prompt_asyn(lst_token, token_map):
     if lst_token in token_map:
         return token_map[lst_token]
+        # return [token[0] for token in token_map[lst_token]]
     return []
 
-def get_history(lst_token):
+def get_history_asyn(lst_token):
     if lst_token in History.history:
         return History.history[lst_token]
     return []
 
-def get_db(previous_tokens, vocab_size, GUESS_SIZE, GUESS_SET_SIZE):
+def get_db_asyn(previous_tokens, vocab_size, GUESS_SIZE, GUESS_SET_SIZE, PAD_PATH=True):
+    # for i in range(len(previous_tokens)):
     outputs = []
     for i in range(len(previous_tokens)):
-        retrieved_token_list, _draft_attn_mask, _tree_indices, _draft_position_ids, _retrieve_indices = DB.db.search(previous_tokens[-i:], choices=64)
+        retrieved_token_list, _draft_attn_mask, _tree_indices, _draft_position_ids, _retrieve_indices = DB.db.search(list(previous_tokens[-i:]), choices=64)
         retrieved_token_list = [[r for r in row if r != -2] for row in retrieved_token_list]
         retrieved_token_list = sorted(retrieved_token_list, key=lambda x: len(x), reverse=True)
         if len(retrieved_token_list) > 0:
@@ -122,31 +134,188 @@ def get_db(previous_tokens, vocab_size, GUESS_SIZE, GUESS_SET_SIZE):
                             from IPython import embed; embed(); exit(0)
                     if check == len(outputs):
                         outputs.append(row)
-                if len(outputs) == GUESS_SET_SIZE:
+                if len(outputs) == GUESS_SET_SIZE and PAD_PATH:
                     return [pad_path(row, GUESS_SIZE, random.randint(0, vocab_size-1)) for row in outputs]
-    return [pad_path(row, GUESS_SIZE, random.randint(0, vocab_size-1)) for row in outputs]
+                elif len(outputs) == GUESS_SET_SIZE and not PAD_PATH:
+                    return outputs
+    if PAD_PATH:
+        return [pad_path(row, GUESS_SIZE, random.randint(0, vocab_size-1)) for row in outputs]
+    else:
+        return outputs
 
-def get_draft_tokens(lst_token, previous_tokens, token_map, vocab_size, order, GUESS_SET_SIZE, GUESS_SIZE): 
-    if lst_token == None:
-        lst_token = previous_tokens[-1]
-    tokens = []
-    guess_source = -1
+def get_prompt(lst_token, token_map):
+    if lst_token in token_map:
+        return token_map[lst_token]
+        # return [token[0] for token in token_map[lst_token]]
+    return []
+
+def get_history(lst_token):
+    if lst_token in History.history:
+        return History.history[lst_token]
+    return []
+
+def get_db(previous_tokens, vocab_size, GUESS_SIZE, GUESS_SET_SIZE, PAD_PATH=True):
+    # for i in range(len(previous_tokens)):
+    outputs = []
+    for i in range(len(previous_tokens)):
+        retrieved_token_list, _draft_attn_mask, _tree_indices, _draft_position_ids, _retrieve_indices = DB.db.search(list(previous_tokens[-i:]), choices=64)
+        retrieved_token_list = [[r for r in row if r != -2] for row in retrieved_token_list]
+        retrieved_token_list = sorted(retrieved_token_list, key=lambda x: len(x), reverse=True)
+        if len(retrieved_token_list) > 0:
+            for row in retrieved_token_list:
+                row = [r for r in row[:GUESS_SIZE] if r != -2]
+                if row not in outputs:
+                    check = 0
+                    for output in outputs:
+                        try:
+                            check += sum(set([output[i] != row[i]  for i in range(min(len(row), len(output)))]))
+                        except IndexError:
+                            from IPython import embed; embed(); exit(0)
+                    if check == len(outputs):
+                        outputs.append(row)
+                if len(outputs) == GUESS_SET_SIZE and PAD_PATH:
+                    return [pad_path(row, GUESS_SIZE, random.randint(0, vocab_size-1)) for row in outputs]
+                elif len(outputs) == GUESS_SET_SIZE and not PAD_PATH:
+                    return outputs
+    if PAD_PATH:
+        return [pad_path(row, GUESS_SIZE, random.randint(0, vocab_size-1)) for row in outputs]
+    else:
+        return outputs
+
+def get_draft_tokens(lst_token, previous_token, token_map, shared_dict, vocab_size, order, GUESS_SET_SIZE, GUESS_SIZE): 
+    if previous_token in shared_dict:
+        tokens = [pad_path(row, GUESS_SIZE, random.randint(0, vocab_size-1)) for row in shared_dict[previous_token]]
+        guess_source = -2
+    else:
+        tokens = []
+        guess_source = -1
+        
     for o in order:
+        if len(tokens) >= 7:
+            return tokens[:7], guess_source
         if o == "W":
-            tokens += get_prompt(lst_token, token_map)
+            tokens += get_prompt(previous_token, token_map)
             guess_source = 0
         elif o == "S":
-            tokens += get_history(lst_token)
+            tokens += get_history(previous_token)
             guess_source = 1
         elif o == "L":
-            added_tokens = get_db(previous_tokens, vocab_size, GUESS_SIZE, GUESS_SET_SIZE)
+            added_tokens = get_db(previous_token, vocab_size, GUESS_SIZE, GUESS_SET_SIZE)
             tokens += added_tokens
             guess_source = 2
         else:
             raise NotImplementedError
-        if len(tokens) >= 7:
-            return tokens[:7], guess_source
     return tokens, guess_source
+
+def get_draft_tokens_(previous_token, token_map, vocab_size, order, GUESS_SET_SIZE, GUESS_SIZE):
+    tokens = []
+    for o in order:
+        if o == "W":
+            tokens += get_prompt(previous_token, token_map)
+        elif o == "S":
+            tokens += get_history(previous_token)
+        elif o == "L":
+            added_tokens = get_db(previous_token, vocab_size, GUESS_SIZE, GUESS_SET_SIZE, False)
+            tokens += added_tokens
+        if len(tokens) >= 7:
+            return tokens
+    return tokens
+            
+
+def get_draft_tokens_parallel(
+    previous_token,
+    token_map,
+    vocab_size,
+    order,
+    GUESS_SET_SIZE,
+    GUESS_SIZE,
+    queue
+):
+    previous_tokens = [previous_token]
+    start_time = time.time()
+    time_limit = 2.5  # Adjusted as per your requirement
+
+    while True:
+        if not previous_tokens:
+            return
+        elapsed_time_ms = (time.time() - start_time) * 1000
+        if elapsed_time_ms + time_limit >= 10:
+            # print("Retrieve Time: ", round((time.time() - start_time) * 1000, 2))
+            return 
+
+        previous_token = previous_tokens.pop(0)
+
+        tokens = get_draft_tokens_(
+            previous_token, token_map, vocab_size, order, GUESS_SET_SIZE, GUESS_SIZE
+        )
+            
+        queue.put((previous_token, tokens))
+
+        lst_token = previous_token[1]  # Assuming previous_token is a tuple
+        Snd_tokens = [token[0] for token in tokens]
+        previous_tokens.extend([(lst_token, Snd_token) for Snd_token in Snd_tokens])
+        
+# Offload the LLM token generation to a separate thread
+def generate_fn(forward_args, forward_function, generate_queue):
+    # start_time = time.time()
+    # print("Check - generate_fn")
+    # If forward_function is CPU-bound, offload to a separate thread
+    # If it's asynchronous, await it directly
+    # if asyncio.iscoroutinefunction(forward_function):
+    outputs = forward_function(**forward_args)
+    generate_queue.put(outputs)
+    # else:
+        # outputs = await asyncio.to_thread(forward_function, **forward_args)
+    # print("Generate Time: ", round((time.time() - start_time) * 1000, 2))
+    return 
+
+
+def generate_process(vocab_size, previous_token, token_map, ORDER, GUESS_SET_SIZE, GUESS_SIZE, model_inputs, past_tokens, guess_tokens, NOT_SEQ, CONTINUE_ALL, output_attentions, output_hidden_states, LEVEL, WINDOW_SIZE, fill_level, DO_WM, forward_function):
+    # retrieve_queue = queue.Queue()
+    generate_queue = queue.Queue()
+
+    jforward_args = {
+        **model_inputs,
+        "past_tokens": past_tokens if DO_WM else None,
+        "guess_tokens": guess_tokens,
+        "return_dict": True,
+        "not_seq": NOT_SEQ,
+        "continue_all": CONTINUE_ALL,
+        "output_attentions": output_attentions,
+        "output_hidden_states": output_hidden_states,
+        "level": LEVEL if DO_WM else None,
+        "WINDOWS_SIZE": WINDOW_SIZE,
+        "guess_size": GUESS_SIZE,
+        "fill_level": fill_level if DO_WM else -1,
+    }
+
+    shared_dict = {}
+    generate_fn(jforward_args, forward_function, generate_queue)
+    outputs = None
+    while not generate_queue.empty():
+        outputs = generate_queue.get()
+    return outputs, shared_dict
+
+    # with ThreadPoolExecutor() as executor:
+    #     task1 = executor.submit(get_draft_tokens_parallel, *(previous_token, token_map, vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE, retrieve_queue))
+    #     generate_fn(jforward_args, forward_function, generate_queue)
+        
+    #     try:
+    #         task1.result(timeout=0.010)  # Task1 should stop after 20ms
+    #     except Exception as e:
+    #         pass
+
+    # shared_dict = {}
+    # while not retrieve_queue.empty():
+    #     key, value = retrieve_queue.get()
+    #     shared_dict[key] = value
+
+    # outputs = None
+    # while not generate_queue.empty():
+    #     outputs = generate_queue.get()
+        
+    # return outputs, shared_dict
+
 
 def greedy_search_proxy(self, *args, **kwargs):
     USE_LADE = int(os.environ.get("USE_LADE", 0))
@@ -169,13 +338,13 @@ def sample_proxy(self, *args, **kwargs):
     else:
         return FUNC_MAP["greedy_search"](self, *args, **kwargs)
 
-def update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE, LRU=True):
+def update_token_map(token_map, previous_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE, LRU=True):
     if GUESS_SET_SIZE != -1 and LRU: #limited guess set size for each key, lru policy  
-        if lst_token not in token_map:
+        lst_token = previous_token
+        if previous_token not in token_map:
             token_map[lst_token] = []
         if past_tokens[-1] is not None:
             tup = tuple(past_tokens[ll][0] for ll in range(1, LEVEL - 1)) + (new_results[0],)
-
 
             if tup in token_map[lst_token]:
                 token_map[lst_token].remove(tup)
@@ -187,50 +356,28 @@ def update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WIND
                 token_map[lst_token] = token_map[lst_token][1:] + [tup]
 
             for i in range(1, WINDOW_SIZE):
-                if past_tokens[0][i - 1] not in token_map:
-                    token_map[past_tokens[0][i - 1]] = []
+                if i == 1:
+                    lst_token = (previous_token[1], past_tokens[0][0])
+                else:
+                    lst_token = (past_tokens[0][i-2], past_tokens[0][i-1])
+                if lst_token not in token_map:
+                    token_map[lst_token] = []
                 tup = tuple(past_tokens[ll][i] for ll in range(1, LEVEL - 1)) + (new_results[i],)
 
-                if tup in token_map[past_tokens[0][i - 1]]:
-                    token_map[past_tokens[0][i - 1]].remove(tup)
-                    token_map[past_tokens[0][i - 1]].append(tup)
-                elif len(token_map[past_tokens[0][i - 1]]) < GUESS_SET_SIZE:
-                    token_map[past_tokens[0][i - 1]].append(tup) 
+                if tup in token_map[lst_token]:
+                    token_map[lst_token].remove(tup)
+                    token_map[lst_token].append(tup)
+                elif len(token_map[lst_token]) < GUESS_SET_SIZE:
+                    token_map[lst_token].append(tup) 
                 else:
-                    assert len(token_map[past_tokens[0][i - 1]]) == GUESS_SET_SIZE
-                    token_map[past_tokens[0][i - 1]] = token_map[past_tokens[0][i - 1]][1:] + [tup]
-
-    elif GUESS_SET_SIZE != -1 and not LRU:
-
-        if lst_token not in token_map:
-            token_map[lst_token] = []
-        for i in range(GUESS_SET_SIZE):
-            tup = tuple(tok for tok in new_results[0])
-            if tup not in token_map[lst_token]:
-                token_map[lst_token] = [tup] + token_map[lst_token]
-            if len(token_map[lst_token]) == GUESS_SET_SIZE:
-                break
-
-    else: #unlimited guess set size for each key 
-        #first add 
-        if lst_token not in token_map:
-            token_map[lst_token] = set()
-        #build tuple
-        tup = tuple(past_tokens[ll][0] for ll in range(1, LEVEL - 1)) + (new_results[0],)
-        #add tuple
-        token_map[lst_token].add(tup) 
-
-        for i in range(1, WINDOW_SIZE):
-            if past_tokens[0][i - 1] not in token_map:
-                token_map[past_tokens[0][i - 1]] = set()
-            tup = tuple(past_tokens[ll][i] for ll in range(1, LEVEL - 1)) + (new_results[i],)
-            token_map[past_tokens[0][i - 1]].add(tup) 
+                    assert len(token_map[lst_token]) == GUESS_SET_SIZE
+                    token_map[lst_token] = token_map[lst_token][1:] + [tup]
 
 def append_new_generated_pool(tokens, token_map, LEVEL, GUESS_SET_SIZE):
     if len(tokens) != LEVEL:
         return 
-    lst_token = tokens[0]
-    tup = tuple(tokens[1:])
+    lst_token = (tokens[0], tokens[1])
+    tup = tuple(tokens[2:])
 
     if GUESS_SET_SIZE != -1: #limited guess set size for each key, lru policy  
         if lst_token not in token_map:
@@ -252,8 +399,8 @@ def append_new_generated_pool(tokens, token_map, LEVEL, GUESS_SET_SIZE):
         token_map[lst_token].add(tup) 
 
 def fill_pool_with_prompt(prompts, token_map, LEVEL, GUESS_SET_SIZE):
-    for start_idx in range(len(prompts) - LEVEL + 1):
-        lst_token = prompts[start_idx]
+    for start_idx in range(1, len(prompts) - LEVEL + 1):
+        lst_token = (prompts[start_idx-1],prompts[start_idx])
         tup = tuple(prompts[start_idx+1:start_idx+LEVEL])
         
         if len(tup) != LEVEL - 1:
@@ -558,7 +705,7 @@ def greedy_search_chat(
 
 import copy
 
-def jacobi_greedy_search_multilevel(
+async def jacobi_greedy_search_multilevel(
     self,
     input_ids: torch.LongTensor,
     logits_processor: Optional[LogitsProcessorList] = None,
@@ -572,7 +719,6 @@ def jacobi_greedy_search_multilevel(
     return_dict_in_generate: Optional[bool] = None,
     synced_gpus: bool = False,
     streamer: Optional["BaseStreamer"] = None,
-    
     chat: bool = False, 
     stop_token: Optional[str]= None,
     **model_kwargs,
@@ -731,7 +877,6 @@ def jacobi_greedy_search_multilevel(
     ORDER = CONFIG_MAP.get("ORDER", "")
     IS_DEBUG = CONFIG_MAP.get("IS_DEBUG", 0)
     PREVIOUS_TOKEN_NUM = CONFIG_MAP.get("PREVIOUS_TOKENS",8)
-    FREQUENCY = CONFIG_MAP.get("FREQUENCY", -1)
 
     GUESS_SIZE = LEVEL - 1
     NOT_SEQ = 0
@@ -810,6 +955,10 @@ def jacobi_greedy_search_multilevel(
 
     accept_length_list = []
     lst_token = None
+    # manager = mp.Manager()
+    # shared_dict = manager.dict()
+    # stop_event = mp.Event()
+    shared_dict = {}
     while True:
         torch.cuda.synchronize()
         verify_start_time = time.time()
@@ -838,23 +987,19 @@ def jacobi_greedy_search_multilevel(
     
         ori_guess = None
         guess_source = -1
-        if FREQUENCY == -1:
-            retrieve_order = ["WSL"]
-        else:
-            retrieve_order = ["WSL"] * (FREQUENCY - 1) + ["LWS"]
-            random.shuffle(retrieve_order)
-        retrieve_order_num = 0
+        torch.cuda.synchronize()
         start_time = time.time()
+        retrieve_order = ["WSL"]
+        # random.shuffle(retrieve_order)
+        retrieve_order_num = 0
         if DO_WM:
             if GUESS_SET_SIZE > 0:
                 if lst_token is None:
                     lst_token = int(input_ids[-1,-1])
-                previous_tokens = input_ids[:,-1 * PREVIOUS_TOKEN_NUM:].tolist()[0]
-                guess_tokens_, guess_source = get_draft_tokens(lst_token, previous_tokens, token_map, self.vocab_size, retrieve_order[retrieve_order_num], GUESS_SET_SIZE, GUESS_SIZE)
-                if FREQUENCY != -1:
-                    retrieve_order_num += 1
-                    if retrieve_order_num == FREQUENCY:
-                        retrieve_order_num = 0
+                                        
+                previous_token = tuple(input_ids[:,-1 * PREVIOUS_TOKEN_NUM:].tolist()[0])
+                guess_tokens_, guess_source = get_draft_tokens(lst_token, previous_token, token_map, shared_dict, self.vocab_size, retrieve_order[retrieve_order_num], GUESS_SET_SIZE, GUESS_SIZE)
+
                 if len(guess_tokens_) > 0:
                     guess_tokens = []
                     for tok in list(guess_tokens_):
@@ -864,9 +1009,9 @@ def jacobi_greedy_search_multilevel(
             else:
                 guess_tokens = None
         else:
-            previous_tokens = input_ids[:,max(init_len - input_ids.shape[1], -1 * PREVIOUS_TOKEN_NUM):].tolist()[0]
+            previous_token = input_ids[:,max(init_len - input_ids.shape[1], -1 * PREVIOUS_TOKEN_NUM):].tolist()[0]
 
-            guess_tokens_, guess_source = get_draft_tokens(None, previous_tokens, token_map, self.vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE)
+            guess_tokens_, guess_source = get_draft_tokens(None, previous_token, token_map, self.vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE)
 
             if len(guess_tokens_) > 0:
                 guess_tokens = []
@@ -874,43 +1019,64 @@ def jacobi_greedy_search_multilevel(
                     guess_tokens += list(tok)
             else:
                 guess_tokens = None
-        draft_time = time.time() - start_time
+        torch.cuda.synchronize()
+        total_time = time.time() - start_time
+
         assert return_dict_in_generate == False
         assert len(logits_processor) == 0
 
-        start_time = time.time()
-        if DO_WM:
-            outputs = self.jforward_multilevel(
-                **model_inputs,
-                past_tokens=past_tokens,
-                guess_tokens=guess_tokens,
-                return_dict=True,
-                not_seq=NOT_SEQ,
-                continue_all=CONTINUE_ALL,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                level=LEVEL,
-                WINDOWS_SIZE=WINDOW_SIZE,
-                guess_size=GUESS_SIZE,
-                fill_level=fill_level,
-            )
-        else:
-            outputs = self.jforward_multilevel(
-                **model_inputs,
-                past_tokens=None,
-                guess_tokens=guess_tokens,
-                return_dict=True,
-                not_seq=NOT_SEQ,
-                continue_all=CONTINUE_ALL,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                level=None,
-                WINDOWS_SIZE=WINDOW_SIZE,
-                guess_size=GUESS_SIZE,
-                fill_level=-1,
-            )
-        gen_time = time.time() - start_time
-        steps += 1
+        # a = time.time()
+        outputs, shared_dict = generate_process(self.vocab_size, previous_token, token_map, ORDER, GUESS_SET_SIZE, GUESS_SIZE, model_inputs, past_tokens, guess_tokens, NOT_SEQ, CONTINUE_ALL, output_attentions, output_hidden_states, LEVEL, WINDOW_SIZE, fill_level, DO_WM, self.jforward_multilevel)
+        # print("Total Time :", round((time.time()-a)* 1000, 2))
+        # result_queue = queue.Queue()
+        # stop_event = threading.Event()
+        # retrieve_thread = threading.Thread(target=get_draft_tokens_parallel, args=(previous_token, token_map, self.vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE, result_queue, stop_event))
+        # retrieve_thread.start()
+        # a = time.time()
+        # if DO_WM:
+        #     outputs = self.jforward_multilevel(
+        #         **model_inputs,
+        #         past_tokens=past_tokens,
+        #         guess_tokens=guess_tokens,
+        #         return_dict=True,
+        #         not_seq=NOT_SEQ,
+        #         continue_all=CONTINUE_ALL,
+        #         output_attentions=output_attentions,
+        #         output_hidden_states=output_hidden_states,
+        #         level=LEVEL,
+        #         WINDOWS_SIZE=WINDOW_SIZE,
+        #         guess_size=GUESS_SIZE,
+        #         fill_level=fill_level,
+        #     )
+        # else:
+        #     outputs = self.jforward_multilevel(
+        #         **model_inputs,
+        #         past_tokens=None,
+        #         guess_tokens=guess_tokens,
+        #         return_dict=True,
+        #         not_seq=NOT_SEQ,
+        #         continue_all=CONTINUE_ALL,
+        #         output_attentions=output_attentions,
+        #         output_hidden_states=output_hidden_states,
+        #         level=None,
+        #         WINDOWS_SIZE=WINDOW_SIZE,
+        #         guess_size=GUESS_SIZE,
+        #         fill_level=-1,
+        #     )
+        # steps += 1
+        # # Stop retrieval
+        # stop_event.set()
+        # retrieve_thread.join(timeout=0.0001)
+
+        # # Collect all retrieved tokens
+        # retrieved_tokens = []
+        # if not result_queue.empty():
+        #     shared_dict = result_queue.get_nowait()
+        # else:
+        #     shared_dict = {}
+            
+
+
         if synced_gpus and this_peer_finished:
             continue  # don't waste resources running the code we don't need
         
@@ -987,7 +1153,10 @@ def jacobi_greedy_search_multilevel(
                         max_hit = gg 
                         max_hit_idx = eg 
                         hits[:max_hit + 1] = correct[:max_hit + 1]
-                        
+
+            #max_hit is the length of longest accepted sequence in verification branch 
+
+            #sync max_hit if we have multi-GPUs
             if DIST_WORKERS > 1:
                 max_hit_all_ranks = [0] * DIST_WORKERS
                 torch.distributed.all_gather_object(max_hit_all_ranks, max_hit)
@@ -998,15 +1167,27 @@ def jacobi_greedy_search_multilevel(
                     hit_info = [hits]
                     torch.distributed.broadcast_object_list(hit_info, src=max_hit_rank)
                     hits = hit_info[0]
-
+                    #print("rank: ", [hits, torch.distributed.get_rank(), max_hit, LOCAL_RANK, max_hit_rank])
+            #if LOCAL_RANK == 0:
+            #    print("rank: ",hits, max_hit)
+            #sync new_results
             new_results = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist()
 
             if DIST_WORKERS > 1:
                 nn_past_tokens = [None] * DIST_WORKERS
                 torch.distributed.all_gather_object(nn_past_tokens, new_results)
                 new_results = sum(nn_past_tokens, [])
+            #else:
+            #    current_past_tokens = new_results
+            #print("brand new past: ", (LOCAL_RANK, past_tokens, new_results))
 
-            update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
+            #time.sleep(1000)
+            # assert len(past_tokens[LEVEL - 2]) == WINDOW_SIZE and len(new_results) == WINDOW_SIZE
+            update_token_map(token_map, previous_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
+            # if max_hit >= 3:
+                # from IPython import embed; embed(); exit(0)
+
+
 
             if past_tokens[-1] != None and check==1:
                 if ALWAYS_FWD_ONE:
@@ -1152,14 +1333,15 @@ def jacobi_greedy_search_multilevel(
         # from IPython import embed; embed()
 
         input_ids = torch.cat([input_ids, torch.tensor(hits[:max_hit + 1], device=next_tokens.device, dtype=next_tokens.dtype).unsqueeze(0)], dim=-1)
-
         # from IPython import embed; embed()
 
         for hit_ids in range(max_hit): 
-            append_new_generated_pool(input_ids[0,-LEVEL-hit_ids:-hit_ids].tolist(), token_map, LEVEL, GUESS_SET_SIZE)
+            append_new_generated_pool(input_ids[0,-LEVEL-hit_ids-1:-hit_ids].tolist(), token_map, LEVEL, GUESS_SET_SIZE)
 
         accept_length_tree = len(all_old_tokens) - cur_length
-        accept_length_list.append((accept_length_tree, guess_source, draft_time, gen_time))    
+        torch.cuda.synchronize()
+        verify_total_time = time.time() - verify_start_time 
+        accept_length_list.append((accept_length_tree, guess_source, total_time, verify_total_time))    
     
         if streamer is not None:
             streamer.put(next_tokens.cpu())
@@ -1523,7 +1705,7 @@ def jacobi_sample_multilevel(
         if DO_WM:
             if past_tokens[LEVEL - 2] is not None and GUESS_SET_SIZE > 0:  
                 ###############NOT ENTER CURRENTLY
-                previous_tokens = input_ids[:,max(init_len - input_ids.shape[1], -1 * PREVIOUS_TOKEN_NUM):].tolist()[0]
+                previous_tokens = tuple(input_ids[:,max(init_len - input_ids.shape[1], -1 * PREVIOUS_TOKEN_NUM):].tolist()[0])
                 guess_tokens_, guess_source = get_draft_tokens(lst_token, previous_tokens, token_map, self.vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE)
 
                 # guess_tokens_ = token_map[lst_token]

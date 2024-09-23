@@ -4,7 +4,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import BaseModelOutputWithPast, CausalLMOutputWithPast, _expand_mask
 
 def j_make_causal_mask_multilevel(
-    level_sizes: list, is_prefill:bool, prefill_size:int, WINDOW_SIZE: int, guess : list, guess_size: int, not_seq:bool, continue_all:bool,input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
+    level_sizes: list,is_prefill:bool, WINDOW_SIZE: int, guess : list, guess_size: int, not_seq:bool, continue_all:bool,input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
 ):
     """
     Make causal mask used for bi-directional self-attention.
@@ -13,24 +13,14 @@ def j_make_causal_mask_multilevel(
     mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
 
     if is_prefill:
-        prefill_mask = torch.full((prefill_size + level_sizes[0], prefill_size + level_sizes[0]), torch.finfo(dtype).min, device=device)
-        prefill_mask_cond = torch.arange(prefill_mask.size(-1), device=device)
-        prefill_mask.masked_fill_(prefill_mask_cond < (prefill_mask_cond + 1).view(prefill_mask.size(-1), 1), 0)
-        prefill_mask = prefill_mask.to(dtype)
-        
-        prefill_mask2 = torch.full((tgt_len - prefill_size, prefill_size), torch.tensor(0).to(dtype), device=device)
-                
-        mask[:prefill_size + level_sizes[0],:prefill_size + level_sizes[0]] = prefill_mask
-        mask[prefill_size:tgt_len,:prefill_size] = prefill_mask2
-        
+        mask_cond = torch.arange(mask.size(-1), device=device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(dtype)
         assert past_key_values_length == 0
-        # assert guess is None
-        # return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
-    if len(level_sizes) == 0:
-        level_sizes = [0,0]
-        tiny_mask_size = 0
-    else:
-        tiny_mask_size = level_sizes[0] + 1
+        assert guess is None
+        return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+    
+    tiny_mask_size = level_sizes[0] + 1
     mask_cond = torch.arange(tiny_mask_size, device=device)
     hm = mask_cond < (mask_cond + 1).view(tiny_mask_size, 1)
 
@@ -78,21 +68,22 @@ def j_make_causal_mask_multilevel(
                 small_m = torch.tensor(small_l).repeat(lguess // guess_size)[:-1 - i]
                 mask[-lguess:,-lguess:] = mask[-lguess:,-lguess:].diagonal_scatter(small_m, -1 - i)
             #assert False 
+
     else:
         assert tgt_len == sum(level_sizes) + 1
+
     #print("level: ", level_sizes)
-    if len(level_sizes) > 1:
-        for ll in range(len(level_sizes)):
-            if ll > 0:
-                # if level_sizes[ll] != tiny_mask_size:
-                    # from IPython import embed; embed(); exit(0)
-                assert level_sizes[ll] == tiny_mask_size
-            mask[tiny_mask_size*ll : tiny_mask_size*(ll+1), : tiny_mask_size].masked_fill_(hm, 0)
-            for row in range(1, ll + 1):
-                mask[tiny_mask_size*ll : tiny_mask_size*(ll+1), tiny_mask_size*row : tiny_mask_size*(row+1)].fill_diagonal_(0)        
-    
+    for ll in range(len(level_sizes)):
+        if ll > 0:
+            assert level_sizes[ll] == tiny_mask_size
+        mask[tiny_mask_size*ll:tiny_mask_size*(ll+1),:tiny_mask_size].masked_fill_(hm, 0)
+        for row in range(1, ll + 1):
+            mask[tiny_mask_size*ll:tiny_mask_size*(ll+1),tiny_mask_size*row:tiny_mask_size*(row+1)].fill_diagonal_(0)
+
+
     #mask.masked_fill_(, 0)
     mask = mask.to(dtype)
+    
 
     #lm[0] += 1
     if past_key_values_length > 0:
@@ -105,14 +96,13 @@ def j_make_causal_mask_multilevel(
 def j_prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length, others):
     # create causal mask
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-    WINDOW_SIZE, is_prefill, prefill_size, guess, guess_size, not_seq, continue_all, level_sizes = others
+    WINDOW_SIZE, is_prefill, guess, guess_size, not_seq, continue_all, level_sizes = others
     combined_attention_mask = None
     #print("size: ", input_shape, past_key_values_length)
     if input_shape[-1] > 1:
         combined_attention_mask = j_make_causal_mask_multilevel(
             level_sizes,
-            is_prefill,
-            prefill_size,        
+            is_prefill,            
             WINDOW_SIZE,
             guess,
             guess_size,
@@ -151,7 +141,6 @@ def LlamaModeljforward(
     return_dict: Optional[bool] = None,
     WINDOWS_SIZE: int=0,
     is_prefill: bool=False,
-    prefill_size: int=0,
     level_sizes: Optional[List[int]] =None,
     guess_size: int=2,
     not_seq: bool=False,
@@ -210,7 +199,7 @@ def LlamaModeljforward(
             padding_mask = None
 
     attention_mask = self.j_prepare_decoder_attention_mask(
-        attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length, (WINDOWS_SIZE, is_prefill, prefill_size, guess, guess_size, not_seq, continue_all, level_sizes), 
+        attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length, (WINDOWS_SIZE, is_prefill, guess, guess_size, not_seq, continue_all, level_sizes), 
     )
 
     hidden_states = inputs_embeds
@@ -371,15 +360,16 @@ def jforward_multilevel(
             ids_list += list(range(lst_id + 1, lst_id + 1 + len(past_tokens[ll])))
         else:
             ids_list += list(range(lst_id + ll, lst_id + ll + len(past_tokens[ll])))
+
     if guess_tokens is not None:
         input_ids = torch.cat((input_ids, torch.tensor(all_past + guess_tokens, device=input_ids.device, dtype=input_ids.dtype).unsqueeze(0)), dim=1)
         guess_ids = list(range(lst_id + 1, lst_id + 1 + guess_size)) * (len(guess_tokens) // guess_size)
-        
         position_ids = torch.cat((position_ids, torch.tensor(ids_list + guess_ids, device=input_ids.device, dtype=input_ids.dtype).unsqueeze(0)), dim=1)
         attention_mask = torch.cat((attention_mask, torch.ones(1, attn_size + len(guess_tokens), \
                 device=input_ids.device, dtype=input_ids.dtype)), dim=1)
-
+    
     else:
+    #print("original size: ", input_ids.size(), position_ids.size(), attention_mask.size())
         input_ids = torch.cat((input_ids, torch.tensor(all_past, device=input_ids.device, dtype=input_ids.dtype).unsqueeze(0)), dim=1)
         position_ids = torch.cat((position_ids, torch.tensor(ids_list, device=input_ids.device, dtype=input_ids.dtype).unsqueeze(0)), dim=1)
         attention_mask = torch.cat((attention_mask, torch.ones(1, attn_size, \
@@ -390,45 +380,23 @@ def jforward_multilevel(
     #assert attention_mask.all().item()
     #attention_mask = None 
     #print("setting: is_prefill", past_tokens[1] is None)
-    # from IPython import embed; embed()
-    if past_tokens != None:
-        outputs = self.model.LlamaModeljforward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            WINDOWS_SIZE=WINDOWS_SIZE,
-            is_prefill=past_tokens[1] is None,
-            prefill_size = prefill_size,
-            level_sizes=level_sizes,
-            guess_size=guess_size,
-            not_seq=not_seq,
-            guess=guess_tokens
-        )
-    else:
-        outputs = self.model.LlamaModeljforward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            WINDOWS_SIZE=WINDOWS_SIZE,
-            is_prefill=False,
-            level_sizes=level_sizes,
-            guess_size=guess_size,
-            not_seq=not_seq,
-            guess=guess_tokens,
-        )
-
+    outputs = self.model.LlamaModeljforward(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        WINDOWS_SIZE=WINDOWS_SIZE,
+        is_prefill=past_tokens[1] is None,
+        level_sizes=level_sizes,
+        guess_size=guess_size,
+        not_seq=not_seq,
+        guess=guess_tokens
+    )
     #print("done fwd")
     hidden_states = outputs[0]
 
@@ -473,19 +441,14 @@ def jforward_multilevel(
         lguess = len(guess_tokens)
     else:
         lguess = 0
-    # from IPython import embed; embed()
+    
     ret.out_logits = ret.logits[:,prefill_size - 1,:].to(input_ids.device)
-    # assert fill_level != -1
-    if lguess > 0 and past_tokens is not None:
+    assert fill_level != -1
+    if lguess > 0:
         ret.inp_logits = ret.logits[:,-len(past_tokens[fill_level])-lguess:-lguess,:].to(input_ids.device)
         ret.guess_logits = ret.logits[:,-lguess:,:].to(input_ids.device)
-    elif lguess > 0 and past_tokens is None:
-        ret.inp_logits = ret.logits[:,-lguess:-lguess,:].to(input_ids.device)
-        ret.guess_logits = ret.logits[:,-lguess:,:].to(input_ids.device)
-    elif lguess == 0 and past_tokens is not None:
-        ret.inp_logits = ret.logits[:,-len(past_tokens[fill_level]):,:].to(input_ids.device)
     else:
-        ret.inp_logits = ret.logits[:,-lguess:-lguess,:].to(input_ids.device)
-        
+        ret.inp_logits = ret.logits[:,-len(past_tokens[fill_level]):,:].to(input_ids.device)
+
     return ret
 

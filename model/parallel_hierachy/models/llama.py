@@ -2,6 +2,7 @@ import torch, math, time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import BaseModelOutputWithPast, CausalLMOutputWithPast, _expand_mask
+import asyncio
 
 def j_make_causal_mask_multilevel(
     level_sizes: list, is_prefill:bool, prefill_size:int, WINDOW_SIZE: int, guess : list, guess_size: int, not_seq:bool, continue_all:bool,input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
@@ -193,8 +194,8 @@ def LlamaModeljforward(
         )
         position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
     else:
-        position_ids = position_ids.view(-1, seq_length).long()
-    
+        position_ids = position_ids.view(-1, seq_length).long()            
+                
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
     # embed positions
@@ -429,7 +430,6 @@ def jforward_multilevel(
             guess=guess_tokens,
         )
 
-    #print("done fwd")
     hidden_states = outputs[0]
 
     if self.config.pretraining_tp > 1:
