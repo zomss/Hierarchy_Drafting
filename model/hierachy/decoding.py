@@ -1,6 +1,5 @@
 from transformers import GenerationMixin
 import torch
-import copy
 import inspect
 import warnings
 from dataclasses import dataclass
@@ -12,10 +11,36 @@ import draftretriever
 import random
 import time
 from collections import Counter
+import copy
 
 FUNC_MAP = {}
 CONFIG_MAP = {}
 COLOR_PRINT = int(os.environ.get("COLOR_PRINT", 0))
+
+def pad_path(path, length, pad_value=-2):
+    """
+    Pad the given path list with a specific value up to a specified length.
+    
+    Parameters:
+    - path (list): The original list that needs padding.
+    - length (int): The desired length of the padded list.
+    - pad_value (optional, default=-2): The value to use for padding.
+    
+    Returns:
+    - list: A new list based on the original path but padded to the desired length.
+    
+    Example:
+    >>> pad_path([1,2,3], 5)
+    [1, 2, 3, -2, -2]
+    
+    Note:
+    If the given path is already longer than the specified length, 
+    then no padding occurs, and the original path is returned.
+    """
+    if len(path) >= length:
+        return path[:length]
+    else:
+        return path + [pad_value] * (length - len(path))
 
 class History:
     history = None
@@ -64,35 +89,8 @@ class DB:
         )
 
 def set_memory(opt):
-    if opt.do_SM:
-        History.get_history(opt.history_file)
-    if opt.do_LM:
-        DB.get_db(opt.db_file)
-
-def pad_path(path, length, pad_value=-2):
-    """
-    Pad the given path list with a specific value up to a specified length.
-    
-    Parameters:
-    - path (list): The original list that needs padding.
-    - length (int): The desired length of the padded list.
-    - pad_value (optional, default=-2): The value to use for padding.
-    
-    Returns:
-    - list: A new list based on the original path but padded to the desired length.
-    
-    Example:
-    >>> pad_path([1,2,3], 5)
-    [1, 2, 3, -2, -2]
-    
-    Note:
-    If the given path is already longer than the specified length, 
-    then no padding occurs, and the original path is returned.
-    """
-    if len(path) >= length:
-        return path[:length]
-    else:
-        return path + [pad_value] * (length - len(path))
+    History.get_history(opt.history_file)
+    DB.get_db(opt.db_file)
 
 def get_prompt(lst_token, token_map):
     if lst_token in token_map:
@@ -130,46 +128,30 @@ def get_draft_tokens(lst_token, previous_tokens, token_map, vocab_size, order, G
     if lst_token == None:
         lst_token = previous_tokens[-1]
     tokens = []
-    guess_source = -1
+    len_tokens = len(tokens)
+    guess_source = []
     for o in order:
         if o == "W":
             tokens += get_prompt(lst_token, token_map)
-            guess_source = 0
+            if len(tokens) - len_tokens > 0:
+                guess_source.extend([0] * (len(tokens) - len_tokens))
         elif o == "S":
             tokens += get_history(lst_token)
-            guess_source = 1
+            if len(tokens) - len_tokens > 0:
+                guess_source.extend([1] * (len(tokens) - len_tokens))
         elif o == "L":
             added_tokens = get_db(previous_tokens, vocab_size, GUESS_SIZE, GUESS_SET_SIZE)
             tokens += added_tokens
-            guess_source = 2
+            if len(tokens) - len_tokens > 0:
+                guess_source.extend([2] * (len(tokens) - len_tokens))
         else:
             raise NotImplementedError
         if len(tokens) >= 7:
-            return tokens[:7], guess_source
+            return tokens[:7], guess_source[:7]
+        len_tokens = len(tokens)
     return tokens, guess_source
 
-def greedy_search_proxy(self, *args, **kwargs):
-    USE_LADE = int(os.environ.get("USE_LADE", 0))
-    CHAT = int(os.environ.get("CHAT", 0))
-    if CHAT and USE_LADE:
-        return jacobi_greedy_search_multilevel(self, chat=True, *args, **kwargs)
-    elif CHAT:
-        return greedy_search_chat(self, *args, **kwargs)
-    
-    if USE_LADE:
-        return jacobi_greedy_search_multilevel(self, chat=False, *args, **kwargs)
-    else:
-        return FUNC_MAP["greedy_search"](self, *args, **kwargs)
-
-def sample_proxy(self, *args, **kwargs):
-    USE_LADE = int(os.environ.get("USE_LADE", 0))
-    
-    if USE_LADE:
-        return jacobi_sample_multilevel(self, chat=int(os.environ.get("CHAT", 0)), *args, **kwargs)
-    else:
-        return FUNC_MAP["greedy_search"](self, *args, **kwargs)
-
-def update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE, LRU=True):
+def update_parallel_token(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE, LRU=True):
     if GUESS_SET_SIZE != -1 and LRU: #limited guess set size for each key, lru policy  
         if lst_token not in token_map:
             token_map[lst_token] = []
@@ -226,16 +208,19 @@ def update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WIND
             tup = tuple(past_tokens[ll][i] for ll in range(1, LEVEL - 1)) + (new_results[i],)
             token_map[past_tokens[0][i - 1]].add(tup) 
 
-def append_new_generated_pool(tokens, token_map, LEVEL, GUESS_SET_SIZE):
-    if len(tokens) != LEVEL:
-        return 
-    lst_token = tokens[0]
-    tup = tuple(tokens[1:])
+def update_generated_tokens(prompts, token_map, LEVEL, GUESS_SET_SIZE):
+    for start_idx in range(len(prompts) - LEVEL + 1):
+        lst_token = prompts[start_idx]
+        tup = tuple(prompts[start_idx+1:start_idx+LEVEL])
+        
+        if len(tup) != LEVEL - 1:
+            return 
+        update_tup(lst_token, tup, token_map, GUESS_SET_SIZE)
 
+def update_tup(lst_token, tup, token_map, GUESS_SET_SIZE):
     if GUESS_SET_SIZE != -1: #limited guess set size for each key, lru policy  
         if lst_token not in token_map:
             token_map[lst_token] = []
-
         if tup in token_map[lst_token]:
             token_map[lst_token].remove(tup)
             token_map[lst_token].append(tup)
@@ -244,37 +229,32 @@ def append_new_generated_pool(tokens, token_map, LEVEL, GUESS_SET_SIZE):
         else:
             assert len(token_map[lst_token]) == GUESS_SET_SIZE
             token_map[lst_token] = token_map[lst_token][1:] + [tup]
-
     else: #unlimited guess set size for each key 
         #first add 
         if lst_token not in token_map:
             token_map[lst_token] = set()
         token_map[lst_token].add(tup) 
 
-def fill_pool_with_prompt(prompts, token_map, LEVEL, GUESS_SET_SIZE):
-    for start_idx in range(len(prompts) - LEVEL + 1):
-        lst_token = prompts[start_idx]
-        tup = tuple(prompts[start_idx+1:start_idx+LEVEL])
-        
-        if len(tup) != LEVEL - 1:
-            return 
-        
-        if GUESS_SET_SIZE != -1: #limited guess set size for each key, lru policy  
-            if lst_token not in token_map:
-                token_map[lst_token] = []
-            if tup in token_map[lst_token]:
-                token_map[lst_token].remove(tup)
-                token_map[lst_token].append(tup)
-            elif len(token_map[lst_token]) < GUESS_SET_SIZE:
-                token_map[lst_token].append(tup) 
-            else:
-                assert len(token_map[lst_token]) == GUESS_SET_SIZE
-                token_map[lst_token] = token_map[lst_token][1:] + [tup]
-        else: #unlimited guess set size for each key 
-            #first add 
-            if lst_token not in token_map:
-                token_map[lst_token] = set()
-            token_map[lst_token].add(tup) 
+def greedy_search_proxy(self, *args, **kwargs):
+    USE_LADE = int(os.environ.get("USE_LADE", 0))
+    CHAT = int(os.environ.get("CHAT", 0))
+    if CHAT and USE_LADE:
+        return jacobi_greedy_search_multilevel(self, chat=True, *args, **kwargs)
+    elif CHAT:
+        return greedy_search_chat(self, *args, **kwargs)
+    
+    if USE_LADE:
+        return jacobi_greedy_search_multilevel(self, chat=False, *args, **kwargs)
+    else:
+        return FUNC_MAP["greedy_search"](self, *args, **kwargs)
+
+def sample_proxy(self, *args, **kwargs):
+    USE_LADE = int(os.environ.get("USE_LADE", 0))
+    
+    if USE_LADE:
+        return jacobi_sample_multilevel(self, chat=int(os.environ.get("CHAT", 0)), *args, **kwargs)
+    else:
+        return FUNC_MAP["greedy_search"](self, *args, **kwargs)
 
 def filter_window(level_window, eos_token_id, reset_func):
     
@@ -556,8 +536,6 @@ def greedy_search_chat(
     else:
         return input_ids
 
-import copy
-
 def jacobi_greedy_search_multilevel(
     self,
     input_ids: torch.LongTensor,
@@ -757,8 +735,6 @@ def jacobi_greedy_search_multilevel(
 
 
     ############### Init methods
-    #random.seed(10) #unset this random seed later
-
     all_old_tokens = input_ids[0].tolist()
     init_len = len(all_old_tokens)
     order_copy_from_idx = [0]
@@ -799,7 +775,7 @@ def jacobi_greedy_search_multilevel(
     #     fill_pool_with_history(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
 
     # if POOL_FROM_PROMPT:
-    fill_pool_with_prompt(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
+    update_generated_tokens(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
     
     if chat:
         init = self.tokenizer.decode(all_old_tokens, skip_special_tokens=True, \
@@ -811,8 +787,6 @@ def jacobi_greedy_search_multilevel(
     accept_length_list = []
     lst_token = None
     while True:
-        torch.cuda.synchronize()
-        verify_start_time = time.time()
         cur_length = len(all_old_tokens)
 
         if synced_gpus:
@@ -836,10 +810,9 @@ def jacobi_greedy_search_multilevel(
             model_inputs["position_ids"] = model_inputs["position_ids"][:, -1 - guess_skip_dist:]
         model_inputs["past_key_values"] = past_key_values
     
-        ori_guess = None
-        guess_source = -1
+        guess_source = []
         if FREQUENCY == -1:
-            retrieve_order = ["WSL"]
+            retrieve_order = [ORDER]
         else:
             retrieve_order = ["WSL"] * (FREQUENCY - 1) + ["LWS"]
             random.shuffle(retrieve_order)
@@ -945,25 +918,13 @@ def jacobi_greedy_search_multilevel(
                 assert fill_level == 0
                 past_tokens[0] = past_tokens[0][1:] 
                 past_tokens[1] = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist()
-                
-                if DIST_WORKERS > 1:
-                    nn_past_tokens = [copy.deepcopy(past_tokens[1])]
-                    torch.distributed.broadcast_object_list(nn_past_tokens, src=DIST_WORKERS - 1)
-                    past_tokens[1] = nn_past_tokens[0]
-
+            
                 fill_level += 1
             elif past_tokens[LEVEL - 2] is None: #filling multi-level window
                 for level in range(fill_level + 1):
                     past_tokens[level] = past_tokens[level][1:] 
                 current_past_tokens = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist()
-                
-                
-                if DIST_WORKERS > 1:
-                    nn_past_tokens = [None] * DIST_WORKERS
-                    torch.distributed.all_gather_object(nn_past_tokens, current_past_tokens)
-                    current_past_tokens = sum(nn_past_tokens, [])
 
-                
                 #time.sleep(10000)
                 past_tokens[fill_level + 1] = current_past_tokens[1:]
                 #print("new past: ", (LOCAL_RANK, past_tokens))
@@ -1006,7 +967,7 @@ def jacobi_greedy_search_multilevel(
                 torch.distributed.all_gather_object(nn_past_tokens, new_results)
                 new_results = sum(nn_past_tokens, [])
 
-            update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
+            update_parallel_token(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
 
             if past_tokens[-1] != None and check==1:
                 if ALWAYS_FWD_ONE:
@@ -1113,14 +1074,6 @@ def jacobi_greedy_search_multilevel(
 
         lst_token = hits[max_hit]
 
-        # if max_hit >= 3:
-            # from IPython import embed; embed(); exit(0)
-
-        # if max_hit >= 3:
-            # temps = [[lst_token] + list(guess_token)  for guess_token in guess_tokens_ if guess_token[0] == hits[0] and guess_token[1] == hits[1]]
-            # for temp in temps:
-            #     append_new_generated_pool(temp, token_map, LEVEL, GUESS_SET_SIZE)            
-
         #stopping condition
         for hit_idx in range(max_hit + 1):
             if eos_token_id is not None and hits[hit_idx] == eos_token_id[0]:
@@ -1130,9 +1083,6 @@ def jacobi_greedy_search_multilevel(
                 break
             else:
                 all_old_tokens.append(hits[max_hit])
-                # append_new_generated_pool(all_old_tokens[-LEVEL:], token_map, LEVEL, GUESS_SET_SIZE)            
-
-
 
         if chat:
             all_str = self.tokenizer.decode(all_old_tokens, skip_special_tokens=True, \
@@ -1156,10 +1106,11 @@ def jacobi_greedy_search_multilevel(
         # from IPython import embed; embed()
 
         for hit_ids in range(max_hit): 
-            append_new_generated_pool(input_ids[0,-LEVEL-hit_ids:-hit_ids].tolist(), token_map, LEVEL, GUESS_SET_SIZE)
+            update_generated_tokens(input_ids[0,-LEVEL-hit_ids:-hit_ids].tolist(), token_map, LEVEL, GUESS_SET_SIZE)
 
         accept_length_tree = len(all_old_tokens) - cur_length
-        accept_length_list.append((accept_length_tree, guess_source, draft_time, gen_time))    
+        hit_idx = max_hit_idx if max_hit > 0 else -1
+        accept_length_list.append((accept_length_tree, guess_source, draft_time, gen_time, hit_idx))    
     
         if streamer is not None:
             streamer.put(next_tokens.cpu())
@@ -1402,7 +1353,7 @@ def jacobi_sample_multilevel(
     unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
     this_peer_finished = False  # used by synced_gpus only
-
+    ############### configurations 
     WINDOW_SIZE = CONFIG_MAP.get("WINDOW_SIZE", 60)
     GUESS_SET_SIZE = CONFIG_MAP.get("GUESS_SET_SIZE", 60)
     ALWAYS_FWD_ONE = CONFIG_MAP.get("ALWAYS_FWD_ONE", 1)
@@ -1411,27 +1362,15 @@ def jacobi_sample_multilevel(
     DIST_WORKERS = CONFIG_MAP.get("DIST_WORKERS", 1)
     LOCAL_RANK = CONFIG_MAP.get("LOCAL_RANK", 0)
     USE_FLASH = CONFIG_MAP.get("USE_FLASH", 0) #not use flash by default
-    USE_AWQ = False #not support AWQ
     DO_WM = CONFIG_MAP.get("DO_WM", 0)
     DO_SM = CONFIG_MAP.get("DO_SM", 0)
     DO_LM = CONFIG_MAP.get("DO_LM", 0)
+    USE_AWQ = False #not support AWQ
+    #IN FLASH ATTENTION WE REORDERED LOOKAHEAD WINDOW 
     ORDER = CONFIG_MAP.get("ORDER", "")
     IS_DEBUG = CONFIG_MAP.get("IS_DEBUG", 0)
     PREVIOUS_TOKEN_NUM = CONFIG_MAP.get("PREVIOUS_TOKENS",8)
-    #IN FLASH ATTENTION WE REORDERED LOOKAHEAD WINDOW 
-
-    # if DO_WM:
-        # assert "W" in ORDER
-    # else:
-    #     assert "W" not in ORDER
-    # if DO_SM:
-        # assert "S" in ORDER
-    # else:
-        # assert "S" not in ORDER
-    # if DO_LM:
-    #     assert "L" in ORDER
-    # else:
-        # assert "L" not in ORDER
+    FREQUENCY = CONFIG_MAP.get("FREQUENCY", -1)
 
     GUESS_SIZE = LEVEL - 1
     NOT_SEQ = 0
@@ -1480,7 +1419,7 @@ def jacobi_sample_multilevel(
     #     fill_pool_with_history(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
 
     # if POOL_FROM_PROMPT:
-    fill_pool_with_prompt(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
+    update_generated_tokens(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
 
     if chat:
         init = self.tokenizer.decode(all_old_tokens, skip_special_tokens=True, \
@@ -1492,6 +1431,7 @@ def jacobi_sample_multilevel(
         assert type(warper) == TemperatureLogitsWarper or type(warper) == TopKLogitsWarper or type(warper) == TopPLogitsWarper,  f"please set top_k=0.0 and top_p=1.0 {warper}"
 
     accept_length_list = []
+    lst_token = None
     # auto-regressive generation
     while True:
         cur_length = len(all_old_tokens)
@@ -1517,16 +1457,19 @@ def jacobi_sample_multilevel(
             model_inputs["position_ids"] = model_inputs["position_ids"][:, -1 - guess_skip_dist:]
         model_inputs["past_key_values"] = past_key_values
 
-        guess_source = -1
-        torch.cuda.synchronize()
+        guess_source = []
         start_time = time.time()
-        if DO_WM:
-            if past_tokens[LEVEL - 2] is not None and GUESS_SET_SIZE > 0:  
-                ###############NOT ENTER CURRENTLY
-                previous_tokens = input_ids[:,max(init_len - input_ids.shape[1], -1 * PREVIOUS_TOKEN_NUM):].tolist()[0]
-                guess_tokens_, guess_source = get_draft_tokens(lst_token, previous_tokens, token_map, self.vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE)
 
-                # guess_tokens_ = token_map[lst_token]
+        if DO_WM:
+            if GUESS_SET_SIZE > 0:
+                if lst_token is None:
+                    lst_token = int(input_ids[-1,-1])
+                previous_tokens = input_ids[:,-1 * PREVIOUS_TOKEN_NUM:].tolist()[0]
+                guess_tokens_, guess_source = get_draft_tokens(lst_token, previous_tokens, token_map, self.vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE)
+                if FREQUENCY != -1:
+                    retrieve_order_num += 1
+                    if retrieve_order_num == FREQUENCY:
+                        retrieve_order_num = 0
                 if len(guess_tokens_) > 0:
                     guess_tokens = []
                     for tok in list(guess_tokens_):
@@ -1536,20 +1479,22 @@ def jacobi_sample_multilevel(
             else:
                 guess_tokens = None
         else:
-            previous_tokens = input_ids[:,max(init_len - input_ids.shape[1], -1*PREVIOUS_TOKEN_NUM):].tolist()[0]
-            guess_tokens_, guess_source  = get_draft_tokens(None, previous_tokens, token_map, self.vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE)
+            previous_tokens = input_ids[:,max(init_len - input_ids.shape[1], -1 * PREVIOUS_TOKEN_NUM):].tolist()[0]
+
+            guess_tokens_, guess_source = get_draft_tokens(None, previous_tokens, token_map, self.vocab_size, ORDER, GUESS_SET_SIZE, GUESS_SIZE)
+
             if len(guess_tokens_) > 0:
                 guess_tokens = []
                 for tok in list(guess_tokens_):
                     guess_tokens += list(tok)
             else:
                 guess_tokens = None
-        torch.cuda.synchronize()
-        total_time = time.time() - start_time    
+        draft_time = time.time() - start_time
         #not support logits_processor yet
         assert return_dict_in_generate == False
         assert len(logits_processor) == 0
 
+        start_time = time.time()
         # forward pass to get next token
         if DO_WM:
             outputs = self.jforward_multilevel(
@@ -1581,15 +1526,13 @@ def jacobi_sample_multilevel(
                 guess_size=GUESS_SIZE,
                 fill_level=-1,
             )
-
-
+        gen_time = time.time() - start_time
         steps += 1
 
         if synced_gpus and this_peer_finished:
             continue  # don't waste resources running the code we don't need
 
         next_token_logits = outputs.out_logits #outputs.logits[:, -1, :]
-
         #not support logits_processor and only support temperature w/o top-p top-k, I will support these two later
         # pre-process distribution
         next_token_scores = logits_warper(input_ids, next_token_logits)
@@ -1605,222 +1548,148 @@ def jacobi_sample_multilevel(
 
         #handling output
         max_hit = 0
-        if DO_WM:
-            if past_tokens[1] is None:
-                #first fill, not use verification branch
-                assert fill_level == 0
-                probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-                hits = [next_tokens.item()] 
-
-                past_tokens[0] = past_tokens[0][1:] 
-                past_tokens[1] = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist() #fill window with argmax
-
-                fill_level += 1
-            elif past_tokens[LEVEL - 2] is None: 
-                #fill other levels, not use verification branch
-                probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-                hits = [next_tokens.item()] 
-
-                for level in range(fill_level + 1):
-                    past_tokens[level] = past_tokens[level][1:] 
-
-                past_tokens[fill_level + 1] = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist()[1:] #fill window with argmax
-                
-                fill_level += 1
-            else:      
-                if guess_tokens is not None:
-                    probs_next = torch.nn.functional.softmax(next_token_scores, dim=-1)[0]
-                    hits = []
-                    #= original model output
-                    guess_logits = logits_warper(input_ids, outputs.guess_logits[0])
-                    guess_probs = torch.nn.functional.softmax(guess_logits, dim=-1) #
-                    #guess_results = torch.argmax(outputs.guess_logits, dim=-1)[0].tolist()
-                    guess_indices = list(range(outputs.guess_logits.size(1) // GUESS_SIZE))
-                    #algorithm modified from specinfer
-                    for idx_in_ngram in range(GUESS_SIZE):
-                        
-                        g_idx = 0
-                        is_accept = False
-                        #print("gues: ", guess_indices)
-                        
-                        while g_idx < len(guess_indices):
-                            guess_idx = guess_indices[g_idx]
-                            guess_offset = guess_idx * GUESS_SIZE
-
-                            #draft_guess is draft model (by lookahead) generation
-                            draft_guess = guess_tokens[guess_offset + idx_in_ngram]
-                            prob_accept = min(1, probs_next[draft_guess].item()) #min(1, prob_llm/prob_draft) #use argmax, prob_draft is 1
-                            sample_prob = random.random()
-
-                            if sample_prob < prob_accept:
-                                #accept
-                                hits.append(draft_guess)
-                                is_accept = True 
-                                max_hit_idx = guess_idx
-                                new_guess_indices = []
-                                for guess_idx_n in guess_indices:
-                                    guess_offset_n = guess_idx_n * GUESS_SIZE
-                                    new_draft_guess = guess_tokens[guess_offset_n + idx_in_ngram]
-                                    if new_draft_guess == draft_guess:
-                                        new_guess_indices.append(guess_idx_n)
-                                guess_indices = new_guess_indices
-                                break 
-                            else:
-                                #not accept
-                                #max norm (argmax)
-                                probs_next[draft_guess] = 0
-                                probs_next = probs_next / probs_next.sum()
-                                g_idx += 1         
-                        
-                        if is_accept:
-                            probs_next = guess_probs[guess_offset + idx_in_ngram]
-                            continue 
-                        else:
-                            new_token_gen = torch.multinomial(probs_next, num_samples=1).item()
-                            #print("non accept: ", probs_next.size(), new_token_gen)
-                            hits.append(new_token_gen)
-                            break
-
-                    #hits.append(new_token_gen)
-
-                    max_hit = len(hits) - 1
-
-                else:
-                    probs_next = torch.nn.functional.softmax(next_token_scores, dim=-1)
-                    next_tokens = torch.multinomial(probs_next, num_samples=1).squeeze(1)
-                    hits = [next_tokens.item()]
-
-
-                #new window level, use argmax to generate
-                new_results = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist()
-                
-                assert len(past_tokens[LEVEL - 2]) == WINDOW_SIZE and len(new_results) == WINDOW_SIZE
-
-                update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
-
-                #update windows when max_hit > 1
-                if ALWAYS_FWD_ONE:
-                    past_tokens[0] = past_tokens[1][1:]
-                    for level in range(1, LEVEL - 2):
-                        past_tokens[level] = past_tokens[level + 1][:]
-
-                    past_tokens[LEVEL - 2] = new_results             
-                else:
-                    past_tokens[0] = past_tokens[1][1 + max_hit:]
-                    for level in range(1, LEVEL - 2):
-                        past_tokens[level] = past_tokens[level + 1][max_hit:]
-
-                    past_tokens[LEVEL - 2] = new_results[max_hit:]
-                
-
-                if max_hit > 0:
-                    if not ALWAYS_FWD_ONE:
-                        for level in range(LEVEL - 1):
-                            past_tokens[level] = past_tokens[level] + [set_token() for _ in range(max_hit)]
-
-                    attention_mask = model_kwargs["attention_mask"]
-                    model_kwargs["attention_mask"] = torch.cat((attention_mask, torch.ones(1, max_hit, device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
-
-                if eos_token_id is not None:
-                    #filter <EOS> (we find too many <EOS> in window lead to numerical error)
-                    filter_window(past_tokens[LEVEL - 2], eos_token_id[0], set_token)
-
-                    #update kv cache of correctly speculated tokens
-            past_key_values = []
-            for idx, kv in enumerate(outputs.past_key_values):
-                for hh in range(max_hit):
-                    assert outputs.step_len == kv[0].size(2)
-                    kv[0][:,:,outputs.kvcache_len + hh,:] = kv[0][:,:,outputs.step_len-len(guess_tokens)+max_hit_idx * GUESS_SIZE + hh,:]
-                    kv[1][:,:,outputs.kvcache_len + hh,:] = kv[1][:,:,outputs.step_len-len(guess_tokens)+max_hit_idx * GUESS_SIZE + hh,:]
-                past_key_values.append( (kv[0][:,:,:outputs.kvcache_len + max_hit,:], kv[1][:,:,:outputs.kvcache_len + max_hit,:]) )
-            outputs.past_key_values = past_key_values
-
-            lst_token = hits[max_hit]
-        else:
+        check = 1
+        temp_hits = []
+        if past_tokens[1] is None:
+            #first fill, not use verification branch
+            assert fill_level == 0
             probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            if guess_tokens is not None:
-                probs_next = torch.nn.functional.softmax(next_token_scores, dim=-1)[0]
-                hits = []
-                #= original model output
-                guess_logits = logits_warper(input_ids, outputs.guess_logits[0])
+            hits = [next_tokens.item()] 
 
-                guess_probs = torch.nn.functional.softmax(guess_logits, dim=-1) #
-                #guess_results = torch.argmax(outputs.guess_logits, dim=-1)[0].tolist()
-                guess_indices = list(range(outputs.guess_logits.size(1) // GUESS_SIZE))
-                #algorithm modified from specinfer
-                for idx_in_ngram in range(GUESS_SIZE):
-                    
-                    g_idx = 0
-                    is_accept = False
-                    #print("gues: ", guess_indices)
-                    
-                    while g_idx < len(guess_indices):
-                        guess_idx = guess_indices[g_idx]
-                        guess_offset = guess_idx * GUESS_SIZE
+            past_tokens[0] = past_tokens[0][1:] 
+            past_tokens[1] = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist() #fill window with argmax
 
-                        #draft_guess is draft model (by lookahead) generation
-                        draft_guess = guess_tokens[guess_offset + idx_in_ngram]
-                        prob_accept = min(1, probs_next[draft_guess].item()) #min(1, prob_llm/prob_draft) #use argmax, prob_draft is 1
-                        sample_prob = random.random()
+            fill_level += 1
+            temp_hits = hits
+        elif past_tokens[LEVEL - 2] is None: 
+            #fill other levels, not use verification branch
+            probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            hits = [next_tokens.item()] 
 
-                        if sample_prob < prob_accept:
-                            #accept
-                            hits.append(draft_guess)
-                            is_accept = True 
-                            max_hit_idx = guess_idx
-                            new_guess_indices = []
-                            for guess_idx_n in guess_indices:
-                                guess_offset_n = guess_idx_n * GUESS_SIZE
-                                new_draft_guess = guess_tokens[guess_offset_n + idx_in_ngram]
-                                if new_draft_guess == draft_guess:
-                                    new_guess_indices.append(guess_idx_n)
-                            guess_indices = new_guess_indices
-                            break 
-                        else:
-                            #not accept
-                            #max norm (argmax)
-                            probs_next[draft_guess] = 0
-                            probs_next = probs_next / probs_next.sum()
-                            g_idx += 1         
-                    
-                    if is_accept:
-                        probs_next = guess_probs[guess_offset + idx_in_ngram]
-                        continue 
+            for level in range(fill_level + 1):
+                past_tokens[level] = past_tokens[level][1:] 
+
+            past_tokens[fill_level + 1] = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist()[1:] #fill window with argmax
+            
+            fill_level += 1
+            check = 0
+            temp_hits = hits
+        if guess_tokens is not None:
+            probs_next = torch.nn.functional.softmax(next_token_scores, dim=-1)[0]
+            hits = []
+            #= original model output
+            guess_logits = logits_warper(input_ids, outputs.guess_logits[0])
+            guess_probs = torch.nn.functional.softmax(guess_logits, dim=-1) #
+            #guess_results = torch.argmax(outputs.guess_logits, dim=-1)[0].tolist()
+            guess_indices = list(range(outputs.guess_logits.size(1) // GUESS_SIZE))
+            #algorithm modified from specinfer
+            for idx_in_ngram in range(GUESS_SIZE):
+                g_idx = 0
+                is_accept = False
+                #print("gues: ", guess_indices)
+                
+                while g_idx < len(guess_indices):
+                    guess_idx = guess_indices[g_idx]
+                    guess_offset = guess_idx * GUESS_SIZE
+
+                    #draft_guess is draft model (by lookahead) generation
+                    draft_guess = guess_tokens[guess_offset + idx_in_ngram]
+                    prob_accept = min(1, probs_next[draft_guess].item()) #min(1, prob_llm/prob_draft) #use argmax, prob_draft is 1
+                    sample_prob = random.random()
+
+                    if sample_prob < prob_accept:
+                        #accept
+                        hits.append(draft_guess)
+                        is_accept = True 
+                        max_hit_idx = guess_idx
+                        new_guess_indices = []
+                        for guess_idx_n in guess_indices:
+                            guess_offset_n = guess_idx_n * GUESS_SIZE
+                            new_draft_guess = guess_tokens[guess_offset_n + idx_in_ngram]
+                            if new_draft_guess == draft_guess:
+                                new_guess_indices.append(guess_idx_n)
+                        guess_indices = new_guess_indices
+                        break 
                     else:
-                        new_token_gen = torch.multinomial(probs_next, num_samples=1).item()
+                        #not accept
+                        #max norm (argmax)
+                        probs_next[draft_guess] = 0
+                        probs_next = probs_next / probs_next.sum()
+                        g_idx += 1     
+                            
+                if is_accept:
+                    probs_next = guess_probs[guess_offset + idx_in_ngram]
+                    continue 
+                else:
+                    if len(temp_hits) > 0:
+                        hits = temp_hits
+                    else:
+                        new_token_gen = torch.multinomial(probs_next, num_samples=1, replacement=True).item()
                         #print("non accept: ", probs_next.size(), new_token_gen)
                         hits.append(new_token_gen)
-                        break
+                    break
+                
+            if idx_in_ngram == GUESS_SIZE - 1 and is_accept:
+                new_token_gen = torch.multinomial(probs_next, num_samples=1, replacement=True).item()
+                hits.append(new_token_gen)
+            
+            max_hit = len(hits) - 1
+        else:
+            probs_next = torch.nn.functional.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.multinomial(probs_next, num_samples=1).squeeze(1)
+            hits = [next_tokens.item()]
 
-                #hits.append(new_token_gen)
+        #new window level, use argmax to generate
+        new_results = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist()
+        
+        # assert len(past_tokens[LEVEL - 2]) == WINDOW_SIZE and len(new_results) == WINDOW_SIZE
 
-                max_hit = len(hits) - 1
-                        
+        update_parallel_token(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
+
+        #update windows when max_hit > 1
+        if past_tokens[-1] != None and check == 1:
+            if ALWAYS_FWD_ONE:
+                past_tokens[0] = past_tokens[1][1:]
+                for level in range(1, LEVEL - 2):
+                    past_tokens[level] = past_tokens[level + 1][:]
+
+                past_tokens[LEVEL - 2] = new_results             
             else:
-                probs_next = torch.nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs_next, num_samples=1).squeeze(1)
-                hits = [next_tokens.item()]
+                past_tokens[0] = past_tokens[1][1 + max_hit:]
+                for level in range(1, LEVEL - 2):
+                    past_tokens[level] = past_tokens[level + 1][max_hit:]
 
-            #new window level, use argmax to generate
-            new_results = torch.argmax(outputs.inp_logits, dim=-1)[0].tolist()
-            if max_hit > 0:
-                attention_mask = model_kwargs["attention_mask"]
-                model_kwargs["attention_mask"] = torch.cat((attention_mask, torch.ones(1, max_hit, device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
+                past_tokens[LEVEL - 2] = new_results[max_hit:]
+        
+
+        if max_hit > 0:
+            if not ALWAYS_FWD_ONE and past_tokens[-1] != None and check == 1:
+                for level in range(LEVEL - 1):
+                    past_tokens[level] = past_tokens[level] + [set_token() for _ in range(max_hit)]
+
+            attention_mask = model_kwargs["attention_mask"]
+            model_kwargs["attention_mask"] = torch.cat((attention_mask, torch.ones(1, max_hit, device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
+
+        if eos_token_id is not None and past_tokens[-1] != None and check == 1:
+            #filter <EOS> (we find too many <EOS> in window lead to numerical error)
+            filter_window(past_tokens[LEVEL - 2], eos_token_id[0], set_token)
+
             #update kv cache of correctly speculated tokens
-            past_key_values = []
-            for idx, kv in enumerate(outputs.past_key_values):
-                for hh in range(max_hit):
-                    assert outputs.step_len == kv[0].size(2)
-                    kv[0][:,:,outputs.kvcache_len + hh,:] = kv[0][:,:,outputs.step_len-len(guess_tokens)+max_hit_idx * GUESS_SIZE + hh,:]
-                    kv[1][:,:,outputs.kvcache_len + hh,:] = kv[1][:,:,outputs.step_len-len(guess_tokens)+max_hit_idx * GUESS_SIZE + hh,:]
-                past_key_values.append( (kv[0][:,:,:outputs.kvcache_len + max_hit,:], kv[1][:,:,:outputs.kvcache_len + max_hit,:]) )
-            outputs.past_key_values = past_key_values
+    
+    
+        past_key_values = []
+        for idx, kv in enumerate(outputs.past_key_values):
+            for hh in range(max_hit):
+                assert outputs.step_len == kv[0].size(2)
+                kv[0][:,:,outputs.kvcache_len + hh,:] = kv[0][:,:,outputs.step_len-len(guess_tokens)+max_hit_idx * GUESS_SIZE + hh,:]
+                kv[1][:,:,outputs.kvcache_len + hh,:] = kv[1][:,:,outputs.step_len-len(guess_tokens)+max_hit_idx * GUESS_SIZE + hh,:]
+            past_key_values.append( (kv[0][:,:,:outputs.kvcache_len + max_hit,:], kv[1][:,:,:outputs.kvcache_len + max_hit,:]) )
+        outputs.past_key_values = past_key_values
 
-            lst_token = hits[max_hit]
-
+        lst_token = hits[max_hit]
+    
         
         for hit_ids in range(max_hit + 1):
             if eos_token_id is not None and hits[hit_ids] == eos_token_id[0]:
@@ -1830,7 +1699,6 @@ def jacobi_sample_multilevel(
                 break
             else:
                 all_old_tokens.append(hits[hit_ids])
-                # append_new_generated_pool(all_old_tokens[-LEVEL:], token_map, LEVEL, GUESS_SET_SIZE)
 
         if chat:
 
@@ -1852,12 +1720,11 @@ def jacobi_sample_multilevel(
         # update generated ids, model inputs, and length for next step
         input_ids = torch.cat([input_ids, torch.tensor(hits[:max_hit + 1], device=input_ids.device, dtype=input_ids.dtype).unsqueeze(0)], dim=-1)
 
+        for hit_ids in range(max_hit): 
+            update_generated_tokens(input_ids[0,-LEVEL-hit_ids:-hit_ids].tolist(), token_map, LEVEL, GUESS_SET_SIZE)
+
         accept_length_tree = len(all_old_tokens) - cur_length
-        accept_length_list.append((accept_length_tree, guess_source, total_time))
-
-
-        #input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-
+        accept_length_list.append((accept_length_tree, guess_source, draft_time, gen_time))
 
         ###not change codes below
         if streamer is not None:

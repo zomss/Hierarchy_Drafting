@@ -17,6 +17,7 @@ def baseline_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0, 
         input_ids,
         do_sample=do_sample,
         temperature=temperature,
+        top_k = 0,
         max_new_tokens=max_new_tokens,
         return_dict_in_generate=True, # Debug
         output_scores=True, #Debug
@@ -26,7 +27,7 @@ def baseline_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0, 
     new_token = len(output_ids[0][0][len(input_ids[0]):])
     step = new_token
     accept_length_list = [1] * new_token
-    return output_ids, new_token, step, accept_length_list
+    return output_ids[0], new_token, step, accept_length_list
 
 
 if __name__ == "__main__":

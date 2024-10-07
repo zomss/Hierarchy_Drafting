@@ -188,6 +188,8 @@ if __name__ == "__main__":
 
     if args.temperature == 0:
         args.top_p = 0
+    # else:
+        # args.top_p = 1.0
 
     args.model_id = args.model_id + "-temperature-" + str(args.temperature) + "-top_p-" + str(args.top_p)
 

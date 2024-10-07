@@ -96,10 +96,10 @@ def get_model_answers(
     # warmup
     for _ in range(3):
         torch.manual_seed(0)
-        conv = get_conversation_template("vicuna")
+        # conv = get_conversation_template("vicuna")
 
-        # conv = get_conversation_template("Llama-2-7b")
-        # conv.set_system_message(system_message=system_prompt_mapping["Llama"])
+        conv = get_conversation_template("Llama-2-7b")
+        conv.set_system_message(system_message=system_prompt_mapping["Llama"])
         
         turns = []
         steps = []
@@ -170,10 +170,10 @@ def get_model_answers(
         for i in range(num_choices):
             cur_accept_lengths_tree = []
             torch.manual_seed(i)
-            conv = get_conversation_template("vicuna")
+            # conv = get_conversation_template("vicuna")
 
-            # conv = get_conversation_template("Llama-2-7b")
-            # conv.set_system_message(system_message=system_prompt_mapping["Llama"])
+            conv = get_conversation_template("Llama-2-7b")
+            conv.set_system_message(system_message=system_prompt_mapping["Llama"])
 
             turns = []
             steps = []
@@ -201,7 +201,6 @@ def get_model_answers(
                     total_time = time.time() - start_time
                     accept_lengths_tree.extend(accept_length_tree)
                     output_ids = output_ids[0][len(input_ids[0]):]
-
                     if conv.stop_token_ids:
                         stop_token_ids_index = [
                             i

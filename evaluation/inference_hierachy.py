@@ -16,14 +16,13 @@ from evaluation.eval import run_eval, reorg_answer_file
 from model.hierachy.utils import augment_all, config_lade
 from model.hierachy.decoding import CONFIG_MAP, set_memory
 
-def hierachy_forward(inputs, model, tokenizer, max_new_tokens, do_sample, temperature, top_k, top_p):
+def hierachy_forward(inputs, model, tokenizer, max_new_tokens, do_sample, temperature):
     model_inputs = inputs.to("cuda")
-    output_ids, idx, accept_length_list, = model.generate(
+    output_ids, idx, accept_length_list = model.generate(
         **model_inputs,
         do_sample=do_sample,
         temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
+        top_k = 0,
         max_new_tokens=max_new_tokens,
     )
     new_token = len(output_ids[0][len(model_inputs.input_ids[0]):])
@@ -109,16 +108,6 @@ if __name__ == "__main__":
         type=float,
         default=0.7
     )
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        default=50
-    )
-    parser.add_argument(
-        "--top_p",
-        type=float,
-        default=0.9
-    )
 
 
     # Memory Setting
@@ -173,8 +162,6 @@ if __name__ == "__main__":
         num_gpus_total=args.num_gpus_total,
         do_sample=args.do_sample,
         temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
         system_prompt=args.system_prompt
     )
 

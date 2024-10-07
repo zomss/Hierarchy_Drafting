@@ -16,12 +16,13 @@ from evaluation.eval import run_eval, reorg_answer_file
 from model.lade.utils import augment_all, config_lade
 from model.lade.decoding import CONFIG_MAP
 
-def lookahead_forward(inputs, model, tokenizer, max_new_tokens):
+def lookahead_forward(inputs, model, tokenizer, max_new_tokens, temperature, do_sample):
     input_ids = inputs.input_ids
     output_ids, idx, accept_length_list = model.generate(
         torch.as_tensor(input_ids).cuda(),
-        do_sample=False,
-        temperature=0.0,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_k=0,
         max_new_tokens=max_new_tokens,
     )
     new_token = len(output_ids[0][len(input_ids[0]):])
@@ -97,6 +98,15 @@ if __name__ == "__main__":
         choices=["float32", "float64", "float16", "bfloat16"],
         help="Override the default dtype. If not set, it will use float16 on GPU.",
     )
+    parser.add_argument(
+        "--do_sample",
+        action="store_true"
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+    )
 
     args = parser.parse_args()
     if int(os.environ.get("USE_LADE", 0)):
@@ -135,6 +145,8 @@ if __name__ == "__main__":
         num_choices=args.num_choices,
         num_gpus_per_model=args.num_gpus_per_model,
         num_gpus_total=args.num_gpus_total,
+        do_sample=args.do_sample,
+        temperature=args.temperature,
     )
 
     reorg_answer_file(answer_file)

@@ -34,7 +34,9 @@ def pld_forward(inputs, model, tokenizer, max_new_tokens):
                 eos_token_ids_index = i
         invalid_len = len(output_ids[0, input_len:]) - eos_token_ids_index - 1
         if invalid_len > 0:
-            accept_length_list[-1] -= invalid_len
+            last_accept = accept_length_list[-1]
+            last_accept = (last_accept[0] - invalid_len, last_accept[1], last_accept[2], last_accept[3])
+            accept_length_list[-1] = last_accept
             new_token -= invalid_len
     return output_ids, new_token, idx+1, accept_length_list
 

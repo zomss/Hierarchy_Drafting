@@ -9,7 +9,6 @@ import torch
 import inspect
 import torch.distributed as dist 
 
-
 def config_lade(WINDOW_SIZE=None, LEVEL=None, DEBUG=None, GUESS_SET_SIZE=None, ALWAYS_FWD_ONE=None, SPLIT_FLAG=None, DIST_WORKERS=None, backend = 'nccl', USE_FLASH=None, DO_WM=None, DO_SM=None, DO_LM=None, IS_DEBUG=None, ORDER=None, PREVIOUS_TOKENS=8, FREQUENCY=-1):
     if WINDOW_SIZE is not None:
         CONFIG_MAP["WINDOW_SIZE"] = WINDOW_SIZE

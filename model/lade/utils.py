@@ -2,7 +2,7 @@ import os
 from transformers import GenerationMixin
 from transformers.models.llama import modeling_llama 
 
-from .decoding import greedy_search_proxy, FUNC_MAP, CONFIG_MAP
+from .decoding import greedy_search_proxy, FUNC_MAP, CONFIG_MAP, sample_proxy
 from .models import llama
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 import torch 
@@ -41,8 +41,8 @@ def augment_generate():
     FUNC_MAP["greedy_search"] = GenerationMixin.greedy_search
     GenerationMixin.greedy_search = greedy_search_proxy
 
-    #FUNC_MAP["sample"] = GenerationMixin.sample
-    #GenerationMixin.sample = sample_proxy
+    FUNC_MAP["sample"] = GenerationMixin.sample
+    GenerationMixin.sample = sample_proxy
     
 def augment_all():
     augment_llama()
