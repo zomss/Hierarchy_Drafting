@@ -96,10 +96,13 @@ def get_model_answers(
     # warmup
     for _ in range(3):
         torch.manual_seed(0)
-        # conv = get_conversation_template("vicuna")
-
-        conv = get_conversation_template("Llama-2-7b")
-        conv.set_system_message(system_message=system_prompt_mapping["Llama"])
+        if 'vicuna' in model_id:
+            conv = get_conversation_template("vicuna")
+        elif 'Llama' in model_id:
+            conv = get_conversation_template("Llama-2-7b")
+            conv.set_system_message(system_message=system_prompt_mapping["Llama"])
+        else:
+            raise NotImplementedError
         
         turns = []
         steps = []
@@ -170,11 +173,14 @@ def get_model_answers(
         for i in range(num_choices):
             cur_accept_lengths_tree = []
             torch.manual_seed(i)
-            # conv = get_conversation_template("vicuna")
-
-            conv = get_conversation_template("Llama-2-7b")
-            conv.set_system_message(system_message=system_prompt_mapping["Llama"])
-
+            if 'vicuna' in model_id:
+                conv = get_conversation_template("vicuna")
+            elif 'Llama' in model_id:
+                conv = get_conversation_template("Llama-2-7b")
+                conv.set_system_message(system_message=system_prompt_mapping["Llama"])
+            else:
+                raise NotImplementedError
+            
             turns = []
             steps = []
             new_tokens = []
